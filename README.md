@@ -90,3 +90,270 @@ python main.py
 
 说明  
 本项目为竞赛练习方案，代码与结果仅作技术交流使用    
+
+## 附录：完整核心源码
+```python
+import pandas as pd
+import numpy as np
+import os
+import warnings
+from lightgbm import LGBMClassifier, early_stopping
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score
+
+warnings.filterwarnings('ignore')
+
+# ===================== 基础配置 =====================
+DATA_PATH = r"kaggle data"
+SAVE_PATH = r"kaggle_final_version"
+os.makedirs(SAVE_PATH, exist_ok=True)
+
+SEEDS = [111, 222, 333, 444, 555]
+N_FOLDS = 5
+
+# 模型参数，按报告调优结果直接写死
+lgb_params = {
+    'learning_rate': 0.0531,
+    'num_leaves': 73,
+    'min_child_samples': 114,
+    'subsample': 0.8481,
+    'colsample_bytree': 0.7846,
+    'reg_alpha': 0.5,
+    'reg_lambda': 2.0,
+    'n_estimators': 1000,
+    'data_sample_strategy': 'goss',
+    'verbosity': -1,
+    'n_jobs': -1,
+}
+
+xgb_params = {
+    'learning_rate': 0.047,
+    'max_depth': 6,
+    'min_child_weight': 15,
+    'subsample': 0.82,
+    'colsample_bytree': 0.76,
+    'reg_alpha': 0.3,
+    'reg_lambda': 1.5,
+    'n_estimators': 1200,
+    'verbosity': 0,
+    'n_jobs': -1,
+    'eval_metric': 'auc'
+}
+
+cat_params = {
+    'learning_rate': 0.062,
+    'depth': 7,
+    'l2_leaf_reg': 3.0,
+    'subsample': 0.85,
+    'iterations': 1000,
+    'verbose': 0,
+    'eval_metric': 'AUC'
+}
+
+# ===================== 读数据 + 全局统计 =====================
+train = pd.read_csv(os.path.join(DATA_PATH, "train.csv"))
+test = pd.read_csv(os.path.join(DATA_PATH, "test.csv"))
+sub = pd.read_csv(os.path.join(DATA_PATH, "sample_submission.csv"))
+
+# 全量算无标签的客观统计量，绝对不碰目标
+all_data = pd.concat([train, test], ignore_index=True)
+race_total_laps = all_data.groupby('Race')['LapNumber'].max().to_dict()
+race_avg_lap = all_data.groupby('Race')['LapTime (s)'].mean().to_dict()
+comp_avg_life = all_data.groupby('Compound')['TyreLife'].mean().to_dict()
+
+# ===================== 特征工程 =====================
+def make_features(df):
+    df = df.copy()
+    
+    # 预处理：缺省值 + 3sigma截断异常值
+    num_cols = df.select_dtypes('number').columns
+    cat_cols = df.select_dtypes('object').columns
+    df[num_cols] = df[num_cols].fillna(0)
+    df[cat_cols] = df[cat_cols].fillna('__NA__')
+    
+    for col in ['LapTime (s)', 'LapTime_Delta', 'Cumulative_Degradation']:
+        mu, sigma = df[col].mean(), df[col].std()
+        df[col] = np.clip(df[col], mu - 3*sigma, mu + 3*sigma)
+    
+    # 1. 基础衍生特征
+    # 比赛进度
+    df['TotalLaps'] = df['Race'].map(race_total_laps)
+    df['Laps_Remaining'] = df['TotalLaps'] - df['LapNumber']
+    df['RaceProgress'] = df['LapNumber'] / df['TotalLaps']
+    
+    # 轮胎磨损系列
+    df['TyreWearRate'] = df['Cumulative_Degradation'] / (df['TyreLife'] + 1)
+    df['TyreLife_Relative'] = df['TyreLife'] / df['Compound'].map(comp_avg_life)
+    df['TyreLife_Remain'] = df['TyreLife'] * (1 - df['RaceProgress'])
+    
+    # 位置与圈速相对值
+    df['Pos_Change_Rate'] = df['Position_Change'] / (df['LapNumber'] + 1)
+    df['LapTime_Relative'] = df['LapTime (s)'] / df['Race'].map(race_avg_lap)
+    
+    # 2. 业务分箱，给树模型提供切分点
+    df['TyreLife_Bin'] = pd.cut(df['TyreLife'], bins=[-1, 5, 10, 15, 20, 25, 30, 999], labels=False)
+    df['RaceStage'] = pd.cut(df['RaceProgress'], bins=[-0.01, 0.3, 0.7, 1.01], labels=False)
+    df['Pos_Bin'] = pd.cut(df['Position'], bins=[0, 5, 10, 15, 20, 99], labels=False)
+    
+    # 3. 数字位特征，抓隐藏周期规律
+    for col in ['LapTime (s)', 'TyreLife']:
+        df[f'{col}_int'] = df[col].astype(int)
+        df[f'{col}_dec1'] = (df[col] * 10).astype(int) % 10
+    
+    # 4. 频率编码
+    for col in ['Driver', 'Compound', 'Race']:
+        df[f'{col}_freq'] = df[col].map(df[col].value_counts(normalize=True))
+    
+    # 5. 聚合类特征（对应报告的自动特征，手写核心几个，不用featuretools避免噪声）
+    df['Track_Comp_AvgLife'] = df.groupby(['Race', 'Compound'])['TyreLife'].transform('mean')
+    df['Driver_Comp_MedianLap'] = df.groupby(['Driver', 'Compound'])['LapNumber'].transform('median')
+    df['Stage_Pos_Mean'] = df.groupby(['Race', 'RaceStage'])['Position'].transform('mean')
+    
+    # 类别特征基础编码
+    for col in cat_cols:
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col].astype(str))
+    
+    return df
+
+# ===================== 工具：折内目标编码 =====================
+def target_encode(tr_df, val_df, cols, target, smooth=10):
+    tr_df = tr_df.copy()
+    val_df = val_df.copy()
+    global_mean = target.mean()
+    
+    for col in cols:
+        tmp = pd.DataFrame({'cat': tr_df[col], 'y': target})
+        agg = tmp.groupby('cat')['y'].agg(['mean', 'count'])
+        agg['smooth'] = (agg['mean']*agg['count'] + global_mean*smooth) / (agg['count'] + smooth)
+        mapping = agg['smooth'].to_dict()
+        
+        tr_df[f'{col}_te'] = tr_df[col].map(mapping)
+        val_df[f'{col}_te'] = val_df[col].map(mapping).fillna(global_mean)
+    
+    return tr_df, val_df
+
+# ===================== 单模型交叉验证训练 =====================
+def cv_train(model_cls, params, X, y, X_test, seed):
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=seed)
+    oof = np.zeros(len(y))
+    test_pred = np.zeros(len(X_test))
+    te_cols = ['Driver', 'Compound', 'Race', 'TyreLife_Bin', 'RaceStage']
+    
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_tr, X_val = X.iloc[tr_idx].copy(), X.iloc[val_idx].copy()
+        y_tr, y_val = y[tr_idx], y[val_idx]
+        
+        # 折内做目标编码，彻底防泄露
+        X_tr, X_val = target_encode(X_tr, X_val, te_cols, y_tr)
+        _, X_te = target_encode(X_tr, X_test.copy(), te_cols, y_tr)
+        
+        p = params.copy()
+        p['random_state'] = seed
+        model = model_cls(**p)
+        
+        # 不同模型早停写法适配
+        if model_cls == LGBMClassifier:
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric='auc',
+                      callbacks=[early_stopping(50, verbose=False)])
+        elif model_cls == XGBClassifier:
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False, early_stopping_rounds=50)
+        else:
+            model.fit(X_tr, y_tr, eval_set=(X_val, y_val), early_stopping_rounds=50, verbose=False)
+        
+        oof[val_idx] = model.predict_proba(X_val)[:, 1]
+        test_pred += model.predict_proba(X_te)[:, 1] / N_FOLDS
+    
+    return oof, test_pred
+
+# ===================== 伪标签增强 =====================
+def add_pseudo(X_train, y_train, X_test, pred, threshold=0.95):
+    # 只取置信度极高的样本当伪标签
+    pos_mask = pred > threshold
+    neg_mask = pred < (1 - threshold)
+    
+    pseudo_X = X_test[pos_mask | neg_mask].reset_index(drop=True)
+    pseudo_y = (pred[pos_mask | neg_mask] > 0.5).astype(int)
+    
+    X_new = pd.concat([X_train, pseudo_X], ignore_index=True)
+    y_new = np.concatenate([y_train, pseudo_y])
+    
+    print(f"  加入伪标签：正样本{pos_mask.sum()}，负样本{neg_mask.sum()}")
+    return X_new, y_new
+
+# ===================== 主流程 =====================
+if __name__ == '__main__':
+    print("开始跑最终版...")
+    
+    # 生成特征
+    print("生成特征...")
+    train_feat = make_features(train)
+    test_feat = make_features(test)
+    
+    drop_cols = ['id', 'PitNextLap']
+    feats = [c for c in train_feat.columns if c not in drop_cols]
+    X = train_feat[feats].reset_index(drop=True)
+    y = train['PitNextLap'].values
+    X_te = test_feat[feats].reset_index(drop=True)
+    
+    print(f"特征维度：{X.shape}")
+    
+    # 第一步：先训一版LGB拿伪标签
+    print("\n第一步：训练基础模型生成伪标签")
+    base_oof, base_test = cv_train(LGBMClassifier, lgb_params, X, y, X_te, seed=42)
+    print(f"  基础模型OOF AUC: {roc_auc_score(y, base_oof):.6f}")
+    
+    X_aug, y_aug = add_pseudo(X, y, X_te, base_test)
+    
+    # 第二步：三模型多种子训练
+    print("\n第二步：三模型多种子训练（含伪标签）")
+    model_list = [
+        (LGBMClassifier, lgb_params, 'LightGBM'),
+        (XGBClassifier, xgb_params, 'XGBoost'),
+        (CatBoostClassifier, cat_params, 'CatBoost')
+    ]
+    
+    oof_all = []
+    test_all = []
+    
+    for cls, params, name in model_list:
+        print(f"\n训练 {name}：")
+        oof_mean = np.zeros(len(y))
+        test_mean = np.zeros(len(X_te))
+        
+        for seed in SEEDS:
+            oof, test_pred = cv_train(cls, params, X_aug, y_aug, X_te, seed)
+            # 只取原训练集部分算分，伪标签部分不计入指标
+            oof_clean = oof[:len(y)]
+            oof_mean += oof_clean / len(SEEDS)
+            test_mean += test_pred / len(SEEDS)
+            print(f"  seed {seed}: {roc_auc_score(y, oof_clean):.6f}")
+        
+        oof_all.append(oof_mean)
+        test_all.append(test_mean)
+        print(f"  {name} 平均: {roc_auc_score(y, oof_mean):.6f}")
+    
+    # 第三步：Stacking融合
+    print("\n第三步：Stacking两层融合")
+    meta_train = np.column_stack(oof_all)
+    meta_test = np.column_stack(test_all)
+    
+    meta_model = LogisticRegression(random_state=42)
+    meta_model.fit(meta_train, y)
+    
+    final_oof = meta_model.predict_proba(meta_train)[:, 1]
+    final_pred = meta_model.predict_proba(meta_test)[:, 1]
+    
+    print(f"  融合后OOF AUC: {roc_auc_score(y, final_oof):.6f}")
+    
+    # 保存提交
+    final_pred = np.clip(final_pred, 0.001, 0.999)
+    sub['PitNextLap'] = final_pred
+    save_file = os.path.join(SAVE_PATH, "f1_pit_final.csv")
+    sub.to_csv(save_file, index=False)
+    
+    print(f"\n跑完了，文件存在：{save_file}"）
